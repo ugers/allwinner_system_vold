@@ -50,6 +50,7 @@
 #include "cryptfs.h"
 
 #define MASS_STORAGE_FILE_PATH  "/sys/class/android_usb/android0/f_mass_storage/lun/file"
+#define UMS_DIRTY_RATIO_DEFAULT  40
 
 VolumeManager *VolumeManager::sInstance = NULL;
 
@@ -67,8 +68,9 @@ VolumeManager::VolumeManager() {
     mUmsSharingCount = 0;
     mSavedDirtyRatio = -1;
     // set dirty ratio to 0 when UMS is active
-    mUmsDirtyRatio = 0;
+    mUmsDirtyRatio = UMS_DIRTY_RATIO_DEFAULT;  /* by javen */
     mVolManagerDisabled = 0;
+    mlun =0;
 }
 
 VolumeManager::~VolumeManager() {
@@ -1181,6 +1183,7 @@ int VolumeManager::shareEnabled(const char *label, const char *method, bool *ena
 
 int VolumeManager::shareVolume(const char *label, const char *method) {
     Volume *v = lookupVolume(label);
+    int part = 0;
 
     if (!v) {
         errno = ENOENT;
@@ -1220,31 +1223,17 @@ int VolumeManager::shareVolume(const char *label, const char *method) {
         return -1;
     }
 
-    int fd;
-    char nodepath[255];
-    snprintf(nodepath,
-             sizeof(nodepath), "/dev/block/vold/%d:%d",
-             MAJOR(d), MINOR(d));
+    part=v->shareVol(mlun);
+    mlun += part;
+    SLOGI("shareVolume: mlun = %d", mlun);
 
-    if ((fd = open(MASS_STORAGE_FILE_PATH, O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
-    }
-
-    if (write(fd, nodepath, strlen(nodepath)) < 0) {
-        SLOGE("Unable to write to ums lunfile (%s)", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    v->handleVolumeShared();
     if (mUmsSharingCount++ == 0) {
         FILE* fp;
         mSavedDirtyRatio = -1; // in case we fail
         if ((fp = fopen("/proc/sys/vm/dirty_ratio", "r+"))) {
             char line[16];
             if (fgets(line, sizeof(line), fp) && sscanf(line, "%d", &mSavedDirtyRatio)) {
+				mUmsDirtyRatio = UMS_DIRTY_RATIO_DEFAULT;
                 fprintf(fp, "%d\n", mUmsDirtyRatio);
             } else {
                 SLOGE("Failed to read dirty_ratio (%s)", strerror(errno));
@@ -1259,6 +1248,8 @@ int VolumeManager::shareVolume(const char *label, const char *method) {
 
 int VolumeManager::unshareVolume(const char *label, const char *method) {
     Volume *v = lookupVolume(label);
+    
+    int part = 0;
 
     if (!v) {
         errno = ENOENT;
@@ -1274,22 +1265,12 @@ int VolumeManager::unshareVolume(const char *label, const char *method) {
         errno = EINVAL;
         return -1;
     }
+    
+    part=v->unshareVol();
+    mlun -= part;
+       
+    SLOGI("unshareVolume: lun = %d", mlun);
 
-    int fd;
-    if ((fd = open(MASS_STORAGE_FILE_PATH, O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
-    }
-
-    char ch = 0;
-    if (write(fd, &ch, 1) < 0) {
-        SLOGE("Unable to write to ums lunfile (%s)", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    v->handleVolumeUnshared();
     if (--mUmsSharingCount == 0 && mSavedDirtyRatio != -1) {
         FILE* fp;
         if ((fp = fopen("/proc/sys/vm/dirty_ratio", "r+"))) {
@@ -1475,7 +1456,13 @@ bool VolumeManager::isMountpointMounted(const char *mp)
 }
 
 int VolumeManager::cleanupAsec(Volume *v, bool force) {
-    int rc = unmountAllAsecsInDir(Volume::SEC_ASECDIR_EXT);
+   
+    /* Only EXTERNAL_STORAGE needs ASEC cleanup. */
+    const char *externalPath = getenv("EXTERNAL_STORAGE") ?: "/mnt/sdcard";
+    if (0 != strcmp(v->getMountpoint(), externalPath))
+        return 0;
+
+	  int rc = unmountAllAsecsInDir(Volume::SEC_ASECDIR_EXT);
 
     AsecIdCollection toUnmount;
     // Find the remaining OBB files that are on external storage.
